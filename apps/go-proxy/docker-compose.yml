@@ -13,7 +13,7 @@ services:
       - REDIS_CLUSTER_MODE=false
       - REDIS_TLS_ENABLED=false
       - PORT=8080
-      - AUTH_TOKEN=test_token
+      - AUTH_TOKEN=test-token
       - JWT_SECRET=${JWT_SECRET:-your-jwt-secret}
       - ENABLE_HMAC=false
       - HMAC_SECRET=${HMAC_SECRET:-your-hmac-secret}
@@ -32,7 +32,7 @@ services:
       - RATE_LIMIT_BURST=100
       - ADAPTIVE_RATE_LIMIT=true
       - METRICS_ENABLED=true
-      - LOG_LEVEL=info
+      - LOG_LEVEL=debug
       - ENABLE_LOCAL_CACHE=true
       - CACHE_TTL=5m
       - CACHE_SIZE=10000
@@ -74,6 +74,7 @@ services:
       - "6380:6379"
     command: >
       redis-server
+      --protected-mode no
       --replicaof redis 6379
       --appendonly yes
       --maxmemory 256mb
@@ -100,6 +101,7 @@ services:
       - "6381:6379"
     command: >
       redis-server
+      --protected-mode no
       --replicaof redis 6379
       --appendonly yes
       --maxmemory 256mb

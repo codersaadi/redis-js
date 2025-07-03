@@ -1,5 +1,5 @@
 # Build stage - using a recent stable Go version
-FROM golang:1.23-alpine AS builder
+FROM golang:1.24-alpine AS builder
 
 # Install build dependencies
 RUN apk update && apk add --no-cache git ca-certificates tzdata
