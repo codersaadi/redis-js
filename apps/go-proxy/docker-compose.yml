@@ -1,5 +1,3 @@
-version: "3.8"
-
 services:
   redis-proxy:
     build:
@@ -10,7 +8,7 @@ services:
       - "9090:9090" # Metrics port
     environment:
       - REDIS_ADDR=redis:6379
-      - REDIS_PASSWORD=${REDIS_PASSWORD:-}
+      - REDIS_PASSWORD=your-redis-password
       - REDIS_DB=0
       - REDIS_CLUSTER_MODE=false
       - REDIS_TLS_ENABLED=false
@@ -52,27 +50,6 @@ services:
       start_period: 40s
     networks:
       - redis-network
-
-  redis:
-    image: redis:7-alpine
-    ports:
-      - "6379:6379"
-    command: >
-      redis-server
-      --appendonly yes
-      --maxmemory 512mb
-      --maxmemory-policy allkeys-lru
-      --tcp-keepalive 60
-      --timeout 300
-    volumes:
-      - redis-data:/data
-      - ./redis.conf:/usr/local/etc/redis/redis.conf:ro
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 10s
-      timeout: 5s
-      retries: 3
     networks:
       - redis-network
 

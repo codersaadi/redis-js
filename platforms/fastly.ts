@@ -77,6 +77,7 @@ export class Redis extends core.Redis {
     }
 
     const client = new HttpClient({
+      // biome-ignore lint/style/noNonNullAssertion: <explanation>
       baseUrl: config.url!,
       retry: config.retry,
       headers: { authorization: `Bearer ${config.token}` },
@@ -96,6 +97,7 @@ export class Redis extends core.Redis {
     });
 
     if (this.enableAutoPipelining) {
+      // biome-ignore lint/correctness/noConstructorReturn: <explanation>
       return this.autoPipeline();
     }
   }

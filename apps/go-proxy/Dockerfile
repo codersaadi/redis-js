@@ -1,54 +1,49 @@
-# Build stage - using latest stable Go with security updates
-FROM golang:1.24-alpine3.21 AS builder
+# Build stage - using a recent stable Go version
+FROM golang:1.23-alpine AS builder
 
-# Install build dependencies with specific versions and security updates
-RUN apk update && \
-    apk upgrade && \
-    apk add --no-cache \
-    git=~2.43 \
-    ca-certificates \
-    tzdata && \
-    rm -rf /var/cache/apk/*
-    
+# Install build dependencies
+RUN apk update && apk add --no-cache git ca-certificates tzdata
+
 # Set working directory
 WORKDIR /app
 
 # Copy go mod files first for better layer caching
 COPY go.mod go.sum ./
 
-# Download dependencies with verification
+# Download dependencies
 RUN go mod download && go mod verify
 
 # Copy source code
 COPY . .
 
-# Build the application with security flags
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
-    -ldflags='-w -s -extldflags "-static" -X main.version=$(date +%Y%m%d)' \
-    -a -installsuffix cgo \
-    -trimpath \
-    -buildmode=pie \
-    -o redis-proxy \
-    .
+# Build the application, creating a static binary
+RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-w -s" -o redis-proxy .
 
-# Final stage - using scratch for absolute minimal attack surface
-FROM scratch
+# Final stage - using distroless for minimal attack surface
+FROM gcr.io/distroless/static-debian12:nonroot
 
 # Copy CA certificates and timezone data from builder
 COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
 COPY --from=builder /usr/share/zoneinfo /usr/share/zoneinfo
 
-# Copy binary from builder stage
-COPY --from=builder /app/redis-proxy /redis-proxy
+# Set working directory
+WORKDIR /app
 
-# Copy configuration files
-COPY --from=builder /app/config/ /config/
+# Copy binary from builder stage
+COPY --from=builder /app/redis-proxy .
+
+# Copy TLS certificates
+COPY --chown=nonroot:nonroot certs ./certs
 
 # Expose ports
 EXPOSE 8080 9090
 
-# No health check possible with scratch image - implement in orchestration layer
-# HEALTHCHECK requires shell which scratch doesn't have
+# Use distroless nonroot user
+USER nonroot
+
+# Health check using the binary itself
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD ["/app/redis-proxy", "healthcheck"]
 
 # Run the application
-ENTRYPOINT ["/redis-proxy"]
+ENTRYPOINT ["/app/redis-proxy"]

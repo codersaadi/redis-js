@@ -5,6 +5,7 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"crypto/tls"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -269,12 +270,12 @@ func NewRedisProxy(config *ProxyConfig) (*RedisProxy, error) {
 			PoolSize:     config.PoolSize,
 			MaxConnAge:   config.MaxConnAge,
 			IdleTimeout:  config.IdleTimeout,
-			TLSConfig: func() *tls.Config {
-				if config.RedisTLSEnabled {
+			TLSConfig: func(cfg *ProxyConfig) *tls.Config { // Pass config as argument
+				if cfg.RedisTLSEnabled {
 					return &tls.Config{InsecureSkipVerify: false}
 				}
 				return nil
-			}(),
+			}(config), // Pass config here
 		})
 	} else {
 		rdb = redis.NewClient(&redis.Options{
@@ -287,12 +288,12 @@ func NewRedisProxy(config *ProxyConfig) (*RedisProxy, error) {
 			PoolSize:     config.PoolSize,
 			MaxConnAge:   config.MaxConnAge,
 			IdleTimeout:  config.IdleTimeout,
-			TLSConfig: func() *tls.Config {
-				if config.RedisTLSEnabled {
+			TLSConfig: func(cfg *ProxyConfig) *tls.Config { // Pass config as argument
+				if cfg.RedisTLSEnabled {
 					return &tls.Config{InsecureSkipVerify: false}
 				}
 				return nil
-			}(),
+			}(config), // Pass config here
 		})
 	}
 
@@ -381,12 +382,12 @@ func (p *RedisProxy) initReadReplicas() error {
 			PoolSize:     p.config.PoolSize,
 			MaxConnAge:   p.config.MaxConnAge,
 			IdleTimeout:  p.config.IdleTimeout,
-			TLSConfig: func() *tls.Config {
-				if p.config.RedisTLSEnabled {
+			TLSConfig: func(cfg *ProxyConfig) *tls.Config { // Pass config as argument
+				if cfg.RedisTLSEnabled {
 					return &tls.Config{InsecureSkipVerify: false}
 				}
 				return nil
-			}(),
+			}(p.config), // Pass p.config here
 		})
 
 		// Test connection
@@ -493,8 +494,8 @@ func (p *RedisProxy) registerCommandHandlers() {
 		"LRANGE": true, "LLEN": true, "LINDEX": true, "SCARD": true,
 		"SMEMBERS": true, "SISMEMBER": true, "ZCARD": true, "ZCOUNT": true,
 		"ZRANGE": true, "ZREVRANGE": true, "ZSCORE": true, "ZRANK": true,
-		"ZREVRANK": true, "TYPE": true, "SCAN": true, "SSCAN": true,
-		"HSCAN": true, "ZSCAN": true, "KEYS": true, "RANDOMKEY": true,
+		"ZREVRANK": true, "TYPE": true, "SCAN": true, "SSCAN": true, "HSCAN": true,
+		"ZSCAN": true, "KEYS": true, "RANDOMKEY": true, "PING": true, "INFO": true,
 	}
 
 	// Register handlers for special commands
@@ -751,10 +752,9 @@ type UpstashResponse struct {
 	Error  string      `json:"error,omitempty"`
 }
 
-type PipelineRequest []UpstashRequest
-
+// MultiExecRequest now directly holds a slice of command arrays
 type MultiExecRequest struct {
-	Commands []UpstashRequest `json:"commands"`
+	Commands [][]interface{} `json:"commands"`
 }
 
 type ProxyConfig struct {
@@ -774,7 +774,7 @@ type ProxyConfig struct {
 	// Authentication & Security
 	AuthToken  string `json:"auth_token" env:"AUTH_TOKEN"`
 	JWTSecret  string `json:"jwt_secret" env:"JWT_SECRET"`
-	EnableHMAC bool   `json:"enable_hmac" env:"ENABLE_HMAC"`
+	EnableHMAC bool   `json:"enable_hmac" env:"ENABLE_HMAC"`	
 	HMACSecret string `json:"hmac_secret" env:"HMAC_SECRET"`
 
 	// Performance
@@ -829,13 +829,13 @@ func (p *RedisProxy) handleRedisCommand(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	var upstashReq UpstashRequest
-	if err := json.Unmarshal(body, &upstashReq); err != nil {
+	var command []interface{} // Changed to directly unmarshal array of command and arguments
+	if err := json.Unmarshal(body, &command); err != nil {
 		p.sendErrorResponse(w, "Invalid JSON in request body", http.StatusBadRequest)
 		return
 	}
 
-	if len(upstashReq.Command) == 0 {
+	if len(command) == 0 {
 		p.sendErrorResponse(w, "Empty command", http.StatusBadRequest)
 		return
 	}
@@ -847,17 +847,17 @@ func (p *RedisProxy) handleRedisCommand(w http.ResponseWriter, r *http.Request) 
 	}
 
 	// Execute command
-	result, err := p.executeCommand(r.Context(), upstashReq.Command)
+	result, err := p.executeCommand(r.Context(), command)
 	if err != nil {
 		p.sendErrorResponse(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
 	// Generate new sync token for write operations
-	newSyncToken := p.generateSyncToken(upstashReq.Command)
+	newSyncToken := p.generateSyncToken(command)
 
 	response := UpstashResponse{Result: result}
-	p.sendJSONResponse(w, response, newSyncToken)
+	p.sendJSONResponse(w, response, newSyncToken, r)
 }
 
 func (p *RedisProxy) executeCommand(ctx context.Context, command []interface{}) (interface{}, error) {
@@ -1102,7 +1102,7 @@ func (p *RedisProxy) handlePipeline(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var pipelineReq PipelineRequest
+	var pipelineReq [][]interface{} // Changed to directly unmarshal array of command arrays
 	if err := json.Unmarshal(body, &pipelineReq); err != nil {
 		p.sendErrorResponse(w, "Invalid JSON in request body", http.StatusBadRequest)
 		return
@@ -1119,12 +1119,12 @@ func (p *RedisProxy) handlePipeline(w http.ResponseWriter, r *http.Request) {
 
 	// Add commands to pipeline
 	cmds := make([]redis.Cmder, len(pipelineReq))
-	for i, req := range pipelineReq {
-		if len(req.Command) == 0 {
+	for i, cmdArgs := range pipelineReq { // Iterate directly over command arguments
+		if len(cmdArgs) == 0 {
 			results[i] = UpstashResponse{Error: "empty command"}
 			continue
 		}
-		cmds[i] = pipe.Do(r.Context(), req.Command...)
+		cmds[i] = pipe.Do(r.Context(), cmdArgs...)
 	}
 
 	// Execute pipeline
@@ -1150,7 +1150,7 @@ func (p *RedisProxy) handlePipeline(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	p.sendJSONResponse(w, results, "")
+	p.sendJSONResponse(w, results, "", r)
 }
 
 // Multi-Exec handling
@@ -1165,7 +1165,7 @@ func (p *RedisProxy) handleMultiExec(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var multiReq MultiExecRequest
+	var multiReq MultiExecRequest // MultiExecRequest now directly holds [][]interface{}
 	if err := json.Unmarshal(body, &multiReq); err != nil {
 		p.sendErrorResponse(w, "Invalid JSON in request body", http.StatusBadRequest)
 		return
@@ -1180,11 +1180,11 @@ func (p *RedisProxy) handleMultiExec(w http.ResponseWriter, r *http.Request) {
 	tx := p.redisClient.TxPipeline()
 	cmds := make([]redis.Cmder, len(multiReq.Commands))
 
-	for i, req := range multiReq.Commands {
-		if len(req.Command) == 0 {
+	for i, cmdArgs := range multiReq.Commands { // Iterate directly over command arguments
+		if len(cmdArgs) == 0 {
 			continue
 		}
-		cmds[i] = tx.Do(r.Context(), req.Command...)
+		cmds[i] = tx.Do(r.Context(), cmdArgs...)
 	}
 
 	results, err := tx.Exec(r.Context())
@@ -1208,7 +1208,7 @@ func (p *RedisProxy) handleMultiExec(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	p.sendJSONResponse(w, response, "")
+	p.sendJSONResponse(w, response, "", r)
 }
 
 // WebSocket handling for streaming
@@ -1228,8 +1228,8 @@ func (p *RedisProxy) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	p.logger.Info("WebSocket connection established", zap.String("remote_addr", r.RemoteAddr))
 
 	for {
-		var req UpstashRequest
-		if err := conn.ReadJSON(&req); err != nil {
+		var command []interface{} // Changed to directly unmarshal array of command and arguments
+		if err := conn.ReadJSON(&command); err != nil {
 			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
 				p.logger.Error("WebSocket read error", zap.Error(err))
 			}
@@ -1237,7 +1237,7 @@ func (p *RedisProxy) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		}
 
 		// Execute command
-		result, err := p.executeCommand(r.Context(), req.Command)
+		result, err := p.executeCommand(r.Context(), command)
 		
 		var response UpstashResponse
 		if err != nil {
@@ -1246,10 +1246,7 @@ func (p *RedisProxy) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			response = UpstashResponse{Result: result}
 		}
 
-		if err := conn.WriteJSON(response); err != nil {
-			p.logger.Error("WebSocket write error", zap.Error(err))
-			break
-		}
+		p.sendJSONResponse(w, response, "", r) // Pass r to sendJSONResponse
 	}
 }
 
@@ -1305,7 +1302,7 @@ func (p *RedisProxy) handleStats(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	p.sendJSONResponse(w, stats, "")
+	p.sendJSONResponse(w, stats, "", r)
 }
 
 // Sync token management for read-your-writes consistency
@@ -1357,15 +1354,85 @@ func (p *RedisProxy) metricsMiddleware(next http.Handler) http.Handler {
 }
 
 // Utility functions
-func (p *RedisProxy) sendJSONResponse(w http.ResponseWriter, data interface{}, syncToken string) {
+func (p *RedisProxy) sendJSONResponse(w http.ResponseWriter, data interface{}, syncToken string, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	if syncToken != "" {
 		w.Header().Set("upstash-sync-token", syncToken)
 	}
 
-	if err := json.NewEncoder(w).Encode(data); err != nil {
+	// Check for Upstash-Encoding header
+	encodeBase64 := false
+	if encodingHeader := r.Header.Get("Upstash-Encoding"); encodingHeader == "base64" {
+		encodeBase64 = true
+	}
+
+	var responseData interface{}
+	if encodeBase64 {
+		// If it's a single UpstashResponse
+		if singleResp, ok := data.(UpstashResponse); ok {
+			encodedResult, err := base64Encode(singleResp.Result)
+			if err != nil {
+				p.logger.Error("Failed to base64 encode result", zap.Error(err))
+				http.Error(w, "Internal server error", http.StatusInternalServerError)
+				return
+			}
+			responseData = UpstashResponse{Result: encodedResult, Error: singleResp.Error}
+		} else if multiResp, ok := data.([]UpstashResponse); ok { // If it's a slice of UpstashResponse (for pipeline/multi-exec)
+			encodedMultiResp := make([]UpstashResponse, len(multiResp))
+			for i, resp := range multiResp {
+				encodedResult, err := base64Encode(resp.Result)
+				if err != nil {
+					p.logger.Error("Failed to base64 encode result in pipeline", zap.Error(err))
+					http.Error(w, "Internal server error", http.StatusInternalServerError)
+					return
+				}
+				encodedMultiResp[i] = UpstashResponse{Result: encodedResult, Error: resp.Error}
+			}
+			responseData = encodedMultiResp
+		} else {
+			// Fallback for other types, just encode the whole thing if possible
+			encodedData, err := base64Encode(data)
+			if err != nil {
+				p.logger.Error("Failed to base64 encode generic data", zap.Error(err))
+				http.Error(w, "Internal server error", http.StatusInternalServerError)
+				return
+			}
+			responseData = encodedData
+		}
+	} else {
+		responseData = data
+	}
+
+
+	if err := json.NewEncoder(w).Encode(responseData); err != nil {
 		p.logger.Error("Failed to encode JSON response", zap.Error(err))
 		http.Error(w, "Internal server error", http.StatusInternalServerError)
+	}
+}
+
+func base64Encode(data interface{}) (interface{}, error) {
+	if data == nil {
+		return nil, nil
+	}
+	switch v := data.(type) {
+	case string:
+		return base64.StdEncoding.EncodeToString([]byte(v)), nil
+	case []byte:
+		return base64.StdEncoding.EncodeToString(v), nil
+	case []interface{}:
+		encodedSlice := make([]interface{}, len(v))
+		for i, item := range v {
+			encodedItem, err := base64Encode(item)
+			if err != nil {
+				return nil, err
+			}
+			encodedSlice[i] = encodedItem
+		}
+		return encodedSlice, nil
+	default:
+		// For other types, convert to string and then encode
+		s := fmt.Sprintf("%v", v)
+		return base64.StdEncoding.EncodeToString([]byte(s)), nil
 	}
 }
 
@@ -1472,6 +1539,21 @@ func getEnvDuration(key string, defaultValue time.Duration) time.Duration {
 
 // Main function
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "healthcheck" {
+		port := getEnv("PORT", "8080")
+		resp, err := http.Get("http://localhost:" + port + "/health")
+		if err != nil {
+			log.Fatalf("Health check failed: %v", err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			body, _ := io.ReadAll(resp.Body)
+			log.Fatalf("Health check failed: status code %d, body: %s", resp.StatusCode, body)
+		}
+		fmt.Println("Health check passed")
+		os.Exit(0)
+	}
+
 	config := LoadConfig()
 
 	proxy, err := NewRedisProxy(config)

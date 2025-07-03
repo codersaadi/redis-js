@@ -261,7 +261,8 @@ export class HttpClient implements Requester {
       } catch (error_) {
         if (requestOptions.signal?.aborted && isSignalFunction) {
           throw error_;
-        } else if (requestOptions.signal?.aborted) {
+        }
+        if (requestOptions.signal?.aborted) {
           const myBlob = new Blob([
             JSON.stringify({ result: requestOptions.signal.reason ?? "Aborted" }),
           ]);

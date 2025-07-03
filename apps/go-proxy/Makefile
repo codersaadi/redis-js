@@ -134,59 +134,59 @@ docker-push:
 # Docker Compose targets
 compose-up:
 	@echo "Starting services with Docker Compose..."
-	docker-compose up -d
+	docker compose up -d
 
 # Start with monitoring stack
 compose-up-monitoring:
 	@echo "Starting services with monitoring..."
-	docker-compose --profile monitoring up -d
+	docker compose --profile monitoring up -d
 
 # Start with cluster mode
 compose-up-cluster:
 	@echo "Starting with Redis cluster..."
-	docker-compose --profile cluster up -d
+	docker compose --profile cluster up -d
 
 # Start with load balancer
 compose-up-lb:
 	@echo "Starting with load balancer..."
-	docker-compose --profile loadbalancer up -d
+	docker compose --profile loadbalancer up -d
 
 # Start all services
 compose-up-all:
 	@echo "Starting all services..."
-	docker-compose --profile monitoring --profile loadbalancer up -d
+	docker compose --profile monitoring --profile loadbalancer up -d
 
 # Stop Docker Compose services
 compose-down:
 	@echo "Stopping Docker Compose services..."
-	docker-compose down
+	docker compose down
 
 # Stop and remove volumes
 compose-down-volumes:
 	@echo "Stopping services and removing volumes..."
-	docker-compose down -v
+	docker compose down -v
 
 # View logs
 compose-logs:
 	@echo "Viewing logs..."
-	docker-compose logs -f
+	docker compose logs -f
 
 # View specific service logs
 compose-logs-proxy:
-	docker-compose logs -f redis-proxy
+	docker compose logs -f redis-proxy
 
 compose-logs-redis:
-	docker-compose logs -f redis
+	docker compose logs -f redis
 
 # Restart services
 compose-restart:
 	@echo "Restarting services..."
-	docker-compose restart
+	docker compose restart
 
 # Scale proxy instances
 compose-scale:
 	@echo "Scaling proxy to 3 instances..."
-	docker-compose up -d --scale redis-proxy=3
+	docker compose up -d --scale redis-proxy=3
 
 # Health check
 health-check:
@@ -203,25 +203,25 @@ load-test:
 # Deployment targets
 deploy-staging:
 	@echo "Deploying to staging..."
-	docker-compose -f docker-compose.yml -f docker-compose.staging.yml up -d
+	docker compose -f docker compose.yml -f docker compose.staging.yml up -d
 
 deploy-production:
 	@echo "Deploying to production..."
-	docker-compose -f docker-compose.yml -f docker-compose.production.yml up -d
+	docker compose -f docker compose.yml -f docker compose.production.yml up -d
 
 # Backup Redis data
 backup:
 	@echo "Creating Redis backup..."
-	docker-compose exec redis redis-cli BGSAVE
-	docker cp $$(docker-compose ps -q redis):/data/dump.rdb ./backups/redis-backup-$$(date +%Y%m%d-%H%M%S).rdb
+	docker compose exec redis redis-cli BGSAVE
+	docker cp $$(docker compose ps -q redis):/data/dump.rdb ./backups/redis-backup-$$(date +%Y%m%d-%H%M%S).rdb
 
 # Restore Redis data
 restore:
 	@echo "Restoring Redis data..."
 	@read -p "Enter backup file path: " backup_file; \
-	docker-compose stop redis; \
-	docker cp $$backup_file $$(docker-compose ps -q redis):/data/dump.rdb; \
-	docker-compose start redis
+	docker compose stop redis; \
+	docker cp $$backup_file $$(docker compose ps -q redis):/data/dump.rdb; \
+	docker compose start redis
 
 # Generate certificates for TLS
 generate-certs:
