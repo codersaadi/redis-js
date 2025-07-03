@@ -30,13 +30,24 @@ import (
 	"go.uber.org/zap"
 	"golang.org/x/time/rate"
 )
+
+
+
+type ReplicaStatus struct {
+	Healthy bool
+	Latency time.Duration
+}
+
 type RedisProxy struct {
 	config          *ProxyConfig
 	redisClient     redis.UniversalClient
 	readReplicas    []redis.UniversalClient
+	replicaHealth   map[string]ReplicaStatus
+	replicaHealthMu sync.RWMutex
 	syncTokens      sync.Map
 	commandHandlers map[string]CommandHandler
 	rateLimiter     *rate.Limiter
+	adaptiveLimiter *rate.Limiter
 	logger          *zap.Logger
 	metrics         *ProxyMetrics
 	cache           *LocalCache
@@ -81,8 +92,8 @@ type LocalCache struct {
 }
 
 type CacheEntry struct {
-	Value     interface{}
-	ExpiresAt time.Time
+	Value       interface{}
+	ExpiresAt   time.Time
 	AccessCount int64
 }
 
@@ -156,7 +167,7 @@ func NewLocalCache(ttl time.Duration, maxSize int) *LocalCache {
 
 func (c *LocalCache) Get(key string) (interface{}, bool) {
 	if val, ok := c.data.Load(key); ok {
-		entry := val.(CacheEntry)
+		entry := val.(*CacheEntry)
 		if time.Now().Before(entry.ExpiresAt) {
 			atomic.AddInt64(&entry.AccessCount, 1)
 			atomic.AddUint64(&c.hits, 1)
@@ -174,10 +185,10 @@ func (c *LocalCache) Set(key string, value interface{}) {
 	defer c.mutex.Unlock()
 
 	if atomic.LoadInt64(&c.size) >= int64(c.maxSize) {
-		c.evictLRU()
+		c.evictLFU()
 	}
 
-	entry := CacheEntry{
+	entry := &CacheEntry{
 		Value:       value,
 		ExpiresAt:   time.Now().Add(c.ttl),
 		AccessCount: 1,
@@ -197,7 +208,7 @@ func (c *LocalCache) cleanup() {
 func (c *LocalCache) evictExpired() {
 	now := time.Now()
 	c.data.Range(func(key, value interface{}) bool {
-		entry := value.(CacheEntry)
+		entry := value.(*CacheEntry)
 		if now.After(entry.ExpiresAt) {
 			c.data.Delete(key)
 			atomic.AddInt64(&c.size, -1)
@@ -206,13 +217,13 @@ func (c *LocalCache) evictExpired() {
 	})
 }
 
-func (c *LocalCache) evictLRU() {
+func (c *LocalCache) evictLFU() {
 	var oldestKey interface{}
-	var oldestAccess int64 = time.Now().Unix()
+	var oldestAccess int64 = -1
 
 	c.data.Range(func(key, value interface{}) bool {
-		entry := value.(CacheEntry)
-		if entry.AccessCount < oldestAccess {
+		entry := value.(*CacheEntry)
+		if oldestAccess == -1 || entry.AccessCount < oldestAccess {
 			oldestAccess = entry.AccessCount
 			oldestKey = key
 		}
@@ -310,6 +321,7 @@ func NewRedisProxy(config *ProxyConfig) (*RedisProxy, error) {
 	if config.EnableLocalCache {
 		cache = NewLocalCache(config.CacheTTL, config.CacheSize)
 	}
+
 	proxy := &RedisProxy{
 		config:          config,
 		redisClient:     rdb,
@@ -319,11 +331,18 @@ func NewRedisProxy(config *ProxyConfig) (*RedisProxy, error) {
 		metrics:         metrics,
 		cache:           cache,
 		isHealthy:       1,
+		replicaHealth:   make(map[string]ReplicaStatus),
 		upgrader: websocket.Upgrader{
 			ReadBufferSize:  1024,
 			WriteBufferSize: 1024,
 			CheckOrigin:     func(r *http.Request) bool { return true },
 		},
+	}
+
+	// Initialize adaptive rate limiter
+	if config.AdaptiveRateLimit {
+		proxy.adaptiveLimiter = rate.NewLimiter(rate.Limit(config.RateLimitRPS), config.RateLimitBurst)
+		go proxy.adjustRateLimit()
 	}
 
 	// Initialize read replicas
@@ -403,6 +422,30 @@ func (p *RedisProxy) startHealthCheck() {
 	}
 }
 
+
+func (p *RedisProxy) adjustRateLimit() {
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		p.replicaHealthMu.RLock()
+		numReplicas := len(p.readReplicas)
+		healthyReplicas := 0
+		for _, status := range p.replicaHealth {
+			if status.Healthy {
+				healthyReplicas++
+			}
+		}
+		p.replicaHealthMu.RUnlock()
+
+		if numReplicas > 0 {
+			healthRatio := float64(healthyReplicas) / float64(numReplicas)
+			newLimit := float64(p.config.RateLimitRPS) * healthRatio
+			p.adaptiveLimiter.SetLimit(rate.Limit(newLimit))
+		}
+	}
+}
+
 func (p *RedisProxy) performHealthCheck() {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -418,10 +461,19 @@ func (p *RedisProxy) performHealthCheck() {
 	}
 
 	// Check read replicas
+	p.replicaHealthMu.Lock()
+	defer p.replicaHealthMu.Unlock()
+
 	healthyReplicas := 0
-	for _, replica := range p.readReplicas {
+	for i, replica := range p.readReplicas {
+		addr := p.config.ReadReplicaNodes[i]
+		start := time.Now()
 		if err := replica.Ping(ctx).Err(); err == nil {
+			latency := time.Since(start)
+			p.replicaHealth[addr] = ReplicaStatus{Healthy: true, Latency: latency}
 			healthyReplicas++
+		} else {
+			p.replicaHealth[addr] = ReplicaStatus{Healthy: false, Latency: 0}
 		}
 	}
 
@@ -672,8 +724,13 @@ func (p *RedisProxy) validateHMAC(r *http.Request) bool {
 
 func (p *RedisProxy) rateLimitMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if p.rateLimiter != nil {
-			if !p.rateLimiter.Allow() {
+		limiter := p.rateLimiter
+		if p.config.AdaptiveRateLimit && p.adaptiveLimiter != nil {
+			limiter = p.adaptiveLimiter
+		}
+
+		if limiter != nil {
+			if !limiter.Allow() {
 				p.sendErrorResponse(w, "Rate limit exceeded", http.StatusTooManyRequests)
 				if p.metrics != nil {
 					p.metrics.ErrorsTotal.WithLabelValues("rate_limit").Inc()
@@ -739,6 +796,7 @@ type ProxyConfig struct {
 	RateLimitEnabled bool `json:"rate_limit_enabled" env:"RATE_LIMIT_ENABLED"`
 	RateLimitRPS     int  `json:"rate_limit_rps" env:"RATE_LIMIT_RPS"`
 	RateLimitBurst   int  `json:"rate_limit_burst" env:"RATE_LIMIT_BURST"`
+	AdaptiveRateLimit bool `json:"adaptive_rate_limit" env:"ADAPTIVE_RATE_LIMIT"`
 
 	// Monitoring
 	MetricsEnabled bool   `json:"metrics_enabled" env:"METRICS_ENABLED"`
@@ -858,11 +916,34 @@ func (p *RedisProxy) executeCommand(ctx context.Context, command []interface{}) 
 
 func (p *RedisProxy) selectClient(cmdName string) redis.UniversalClient {
 	if p.isReadOnlyCommand(cmdName) && len(p.readReplicas) > 0 {
-		// Round-robin selection of read replicas
+		// Latency-based routing for read replicas
+		if client := p.getFastestReplica(); client != nil {
+			return client
+		}
+		// Fallback to round-robin if no healthy replicas with latency info
 		index := atomic.AddUint64(&p.replicaCounter, 1) % uint64(len(p.readReplicas))
 		return p.readReplicas[index]
 	}
 	return p.redisClient
+}
+
+func (p *RedisProxy) getFastestReplica() redis.UniversalClient {
+	p.replicaHealthMu.RLock()
+	defer p.replicaHealthMu.RUnlock()
+
+	var bestReplica redis.UniversalClient
+	var minLatency time.Duration = -1
+
+	for i, addr := range p.config.ReadReplicaNodes {
+		if status, ok := p.replicaHealth[addr]; ok && status.Healthy {
+			if minLatency == -1 || status.Latency < minLatency {
+				minLatency = status.Latency
+				bestReplica = p.readReplicas[i]
+			}
+		}
+	}
+
+	return bestReplica
 }
 
 func (p *RedisProxy) isReadOnlyCommand(cmdName string) bool {
@@ -1198,11 +1279,15 @@ func (p *RedisProxy) handleReady(w http.ResponseWriter, r *http.Request) {
 }
 
 func (p *RedisProxy) handleStats(w http.ResponseWriter, r *http.Request) {
+	p.replicaHealthMu.RLock()
+	defer p.replicaHealthMu.RUnlock()
+
 	stats := map[string]interface{}{
 		"uptime":             time.Since(time.Now()).String(), // This would need to be tracked properly
 		"total_connections":  "N/A", // Would need connection tracking
 		"healthy":            atomic.LoadInt32(&p.isHealthy) == 1,
 		"read_replicas":      len(p.readReplicas),
+		"read_replicas_status": p.replicaHealth,
 		"cluster_mode":       p.config.RedisClusterMode,
 		"cache_enabled":      p.config.EnableLocalCache,
 		"pipeline_enabled":   p.config.EnablePipeline,
@@ -1328,6 +1413,7 @@ func LoadConfig() *ProxyConfig {
 		RateLimitEnabled:    getEnvBool("RATE_LIMIT_ENABLED", false),
 		RateLimitRPS:        getEnvInt("RATE_LIMIT_RPS", 1000),
 		RateLimitBurst:      getEnvInt("RATE_LIMIT_BURST", 100),
+		AdaptiveRateLimit:   getEnvBool("ADAPTIVE_RATE_LIMIT", false),
 		MetricsEnabled:      getEnvBool("METRICS_ENABLED", true),
 		LogLevel:            getEnv("LOG_LEVEL", "info"),
 		EnableLocalCache:    getEnvBool("ENABLE_LOCAL_CACHE", false),

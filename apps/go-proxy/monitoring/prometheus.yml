@@ -1,0 +1,112 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+rule_files:
+  - "rules/*.yml"
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets:
+            - alertmanager:9093
+
+scrape_configs:
+  - job_name: "prometheus"
+    static_configs:
+      - targets: ["localhost:9090"]
+
+  - job_name: "redis-proxy"
+    static_configs:
+      - targets: ["redis-proxy:9090"]
+    metrics_path: /metrics
+    scrape_interval: 5s
+    scrape_timeout: 5s
+
+  - job_name: "redis"
+    static_configs:
+      - targets: ["redis-exporter:9121"]
+    scrape_interval: 5s
+
+  - job_name: "node-exporter"
+    static_configs:
+      - targets: ["node-exporter:9100"]
+
+---
+# monitoring/grafana/datasources/prometheus.yml
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: true
+
+---
+# monitoring/grafana/dashboards/dashboard.yml
+apiVersion: 1
+
+providers:
+  - name: "redis-proxy"
+    orgId: 1
+    folder: ""
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 10
+    allowUiUpdates: true
+    options:
+      path: /etc/grafana/provisioning/dashboards
+
+---
+# monitoring/rules/redis-proxy.yml
+groups:
+  - name: redis-proxy
+    rules:
+      - alert: RedisProxyDown
+        expr: up{job="redis-proxy"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Redis Proxy is down"
+          description: "Redis Proxy has been down for more than 1 minute"
+
+      - alert: RedisProxyHighErrorRate
+        expr: rate(upstash_proxy_errors_total[5m]) > 0.1
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High error rate in Redis Proxy"
+          description: "Error rate is {{ $value }} errors per second"
+
+      - alert: RedisProxyHighLatency
+        expr: histogram_quantile(0.95, rate(upstash_proxy_request_duration_seconds_bucket[5m])) > 0.5
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High latency in Redis Proxy"
+          description: "95th percentile latency is {{ $value }}s"
+
+      - alert: RedisProxyLowCacheHitRate
+        expr: rate(upstash_proxy_cache_hits_total[5m]) / (rate(upstash_proxy_cache_hits_total[5m]) + rate(upstash_proxy_cache_misses_total[5m])) < 0.8
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Low cache hit rate"
+          description: "Cache hit rate is {{ $value | humanizePercentage }}"
+
+      - alert: RedisDown
+        expr: up{job="redis"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Redis is down"
+          description: "Redis has been down for more than 1 minute"
+
+      - alert: RedisHighMemoryUsage
