@@ -1,0 +1,91 @@
+// last time tests results
+... first 3673 lines hidden ...                                                        │
+ │    [203.00ms]                                                                             │
+ │    (fail) LT and GT > LT > should fail to replace if its not less than                    │
+ │    [204.00ms]                                                                             │
+ │    (fail) without options > returns cursor and members [4.00ms]                           │
+ │    (fail) with match > returns cursor and members [102.00ms]                              │
+ │    (fail) with count > returns cursor and members [100.00ms]                              │
+ │    (fail) XLEN > should approximately trim stream to 30 items [256.00ms]                  │
+ │    (fail) expires a hash key at a specific timestamp with NX option                       │
+ │    [3003.99ms]                                                                            │
+ │    (fail) Return the values at path from multiple key arguments [103.00ms]                │
+ │    (fail) returns a random key [5243.99ms]                                                │
+ │    (fail) without options > returns cursor and keys [3.00ms]                              │
+ │    (fail) with match > returns cursor and keys [102.00ms]                                 │
+ │    (fail) with count > returns cursor and keys [101.00ms]                                 │
+ │    (fail) with type > returns cursor and keys [201.00ms]                                  │
+ │    (fail) with withType > returns cursor and keys with types [203.00ms]                   │
+ │    (fail) gets exiting values [2.00ms]                                                    │
+ │    (fail) returns the cardinality [2.00ms]                                                │
+ │    (fail) with message > returns the message [1.00ms]                                     │
+ │    (fail) without message > returns pong [5261.99ms]                                      │
+ │    (fail) writes the union to destination [106.00ms]                                      │
+ │    (fail) sets value [2003.99ms]                                                          │
+ │    (fail) deletes a field that exists [102.00ms]                                          │
+ │    (fail) deletes multiple fields [201.00ms]                                              │
+ │    (fail) without options > returns cursor and members [2.00ms]                           │
+ │    (fail) with match > returns cursor and members [101.00ms]                              │
+ │    (fail) with count > returns cursor and members [102.00ms]                              │
+ │    (fail) gets an exiting value [5.00ms]                                                  │
+ │    (fail) gets a non-existing value [98.00ms]                                             │
+ │    (fail) with existing hash > returns all keys [1.00ms]                                  │
+ │    (fail) overwrites the original value [102.00ms]                                        │
+ │    (fail) sets a new value if empty [2.00ms]                                              │
+ │    (fail) adds the element [102.00ms]                                                     │
+ │    (fail) COPY test > should handle same source and destination keys                      │
+ │    [100.00ms]                                                                             │
+ │    (fail) gets an exiting value, then deletes [102.00ms]                                  │
+ │    (fail) gets a non-existing value [1.00ms]                                              │
+ │    (fail) NX > should set expiry only when the key has no expiry [2003.99ms]              │
+ │    (fail) XX > should set expiry only when the key has an existing expiry                 │
+ │    [6102.98ms]                                                                            │
+ │    (fail) GT > should set expiry only when the new expiry is greater than                 │
+ │    current one [6102.98ms]                                                                │
+ │    (fail) LT > should set expiry only when the new expiry is less than                    │
+ │    current one [4102.99ms]                                                                │
+ │    (fail) expires a key correctly [2101.99ms]                                             │
+ │    (fail) returns the rank [1.00ms]                                                       │
+ │    (fail) when list does not exist > returns null [101.00ms]                              │
+ │    (fail) Pattern Subscriber > receives pattern matched messages [1106.00ms]              │
+ │    (fail) Pattern Subscriber > handles pattern-specific messages with channel             │
+ │    info [1103.00ms]                                                                       │
+ │    (fail) Pattern Subscriber > handles multiple patterns [1105.00ms]                      │
+ │    (fail) Pattern Subscriber > unsubscribe from specific pattern [1005.00ms]              │
+ │    (fail) Pattern Subscriber > pattern and regular subscriptions work                     │
+ │    together [1003.00ms]                                                                   │
+ │    (fail) returns all members of the set [3.00ms]                                         │
+ │    (fail) gets an exiting value [3.00ms]                                                  │
+ │    (fail) gets a non-existing value [101.00ms]                                            │
+ │    (fail) gets an object [1.00ms]                                                         │
+ │    (fail) returns the cardinality [1.00ms]                                                │
+ │    (fail) returns the cardinality [1.00ms]                                                │
+ │    (fail) returns the ttl on a key [2.00ms]                                               │
+ │    (fail) returns the score [1.00ms]                                                      │
+ │    (fail) without options > expires the key [2002.99ms]                                   │
+ │    (fail) return the length [2.00ms]                                                      │
+ │    (fail) returns all fields [5.00ms]                                                     │
+ │    (fail) properly return bigint precisely [99.00ms]                                      │
+ │    (fail) sets value [101.00ms]                                                           │
+ │    (fail) expires a hash key in milliseconds [1505.00ms]                                  │
+ │    (fail) stors the diff [102.00ms]                                                       │
+ │    (fail) gets exiting values [3.00ms]                                                    │
+ │    (fail) gets an exiting value [2.00ms]                                                  │
+ │    (fail) gets a non-existing hash [101.00ms]                                             │
+ │    (fail) gets a non-existing field [2.00ms]                                              │
+ │    (fail) gets an object [102.00ms]                                                       │
+ │    (fail) returns the rank [2.00ms]                                                       │
+ │    (fail) without options > returns cursor and members [2.00ms]                           │
+ │    (fail) with match > returns cursor and members [102.00ms]                              │
+ │    (fail) ExecCommand > array responses > KEYS [202.00ms]                                 │
+ │    (fail) ExecCommand > error handling > wrong number of arguments                        │
+ │    [5685.98ms]                                                                            │
+ │    (fail) ExecCommand > argument type handling > numeric arguments [1.00ms]               │
+ │    (fail) ExecCommand > argument type handling > boolean arguments [101.00ms]             │
+ │    (fail) XPENDING > should get specific consumer [99.00ms]                               │
+ │    (fail) returns the correct range [2.00ms]                                              │
+ │                                                                                           │
+ │     393 pass                                                                              │
+ │     164 fail                                                                              │
+ │     617 expect() calls                                                                    │
+ │    Ran 557 tests across 193 files. [145.57s]       

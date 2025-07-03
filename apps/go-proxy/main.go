@@ -60,7 +60,7 @@ type RedisProxy struct {
 }
 
 // Command handling
-type CommandHandler func(ctx context.Context, client redis.UniversalClient, args []interface{}) (interface{}, error)
+type CommandHandler func(ctx context.Context, client redis.UniversalClient, fullCommand []interface{}) (interface{}, error)
 
 // JWT Claims
 type JWTClaims struct {
@@ -743,18 +743,9 @@ func (p *RedisProxy) rateLimitMiddleware(next http.Handler) http.Handler {
 	})
 }
 // Core structures
-type UpstashRequest struct {
-	Command []interface{} `json:"command"`
-}
-
 type UpstashResponse struct {
 	Result interface{} `json:"result"`
 	Error  string      `json:"error,omitempty"`
-}
-
-// MultiExecRequest now directly holds a slice of command arrays
-type MultiExecRequest struct {
-	Commands [][]interface{} `json:"commands"`
 }
 
 type ProxyConfig struct {
@@ -829,10 +820,23 @@ func (p *RedisProxy) handleRedisCommand(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	var command []interface{} // Changed to directly unmarshal array of command and arguments
+	var command []interface{}
 	if err := json.Unmarshal(body, &command); err != nil {
 		p.sendErrorResponse(w, "Invalid JSON in request body", http.StatusBadRequest)
 		return
+	}
+
+	p.logger.Debug("Received command", zap.Any("command", command))
+
+	// Decode command arguments if Upstash-Encoding is base64
+	if r.Header.Get("Upstash-Encoding") == "base64" {
+		decodedCommand, err := base64DecodeCommand(command)
+		if err != nil {
+			p.sendErrorResponse(w, fmt.Sprintf("Failed to decode command: %v", err), http.StatusBadRequest)
+			return
+		}
+		command = decodedCommand
+		p.logger.Debug("Decoded command", zap.Any("command", command))
 	}
 
 	if len(command) == 0 {
@@ -865,8 +869,13 @@ func (p *RedisProxy) executeCommand(ctx context.Context, command []interface{}) 
 		return nil, fmt.Errorf("empty command")
 	}
 
-	cmdName := strings.ToUpper(fmt.Sprintf("%v", command[0]))
-	args := command[1:]
+	cmdName, ok := command[0].(string)
+	if !ok {
+		return nil, fmt.Errorf("command name must be a string")
+	}
+	cmdName = strings.ToUpper(cmdName)
+
+	p.logger.Debug("Executing command", zap.String("command_name", cmdName), zap.Any("args", command[1:]))
 
 	// Update metrics
 	if p.metrics != nil {
@@ -880,37 +889,48 @@ func (p *RedisProxy) executeCommand(ctx context.Context, command []interface{}) 
 			if p.metrics != nil {
 				p.metrics.CacheHits.Inc()
 			}
+			p.logger.Debug("Cache hit", zap.String("key", cacheKey))
 			return cached, nil
 		}
 		if p.metrics != nil {
 			p.metrics.CacheMisses.Inc()
 		}
+		p.logger.Debug("Cache miss", zap.String("key", cacheKey))
 	}
 
 	// Use command handler if available
 	if handler, exists := p.commandHandlers[cmdName]; exists {
-		result, err := handler(ctx, p.redisClient, args)
+		result, err := handler(ctx, p.redisClient, command)
 		if err == nil && p.cache != nil && p.isReadOnlyCommand(cmdName) {
 			cacheKey := p.buildCacheKey(command)
 			p.cache.Set(cacheKey, result)
 		}
+		p.logger.Debug("Command handler result", zap.Any("result", result), zap.Error(err))
 		return result, err
 	}
 
 	// Default command execution
 	client := p.selectClient(cmdName)
+	p.logger.Debug("Sending to Redis", zap.String("command", cmdName), zap.Any("args", command[1:]), zap.String("client_type", fmt.Sprintf("%T", client)))
 	cmd := client.Do(ctx, command...)
 	if cmd != nil {
 		result, err := cmd.Result()
 		if err != nil {
+			if err == redis.Nil {
+				p.logger.Debug("Redis returned nil", zap.String("command", cmdName))
+				return nil, nil // Convert redis.Nil to JSON null
+			}
+			p.logger.Error("Redis command error", zap.String("command", cmdName), zap.Error(err))
 			return nil, err
 		}
 		if p.cache != nil && p.isReadOnlyCommand(cmdName) {
 			cacheKey := p.buildCacheKey(command)
 			p.cache.Set(cacheKey, result)
 		}
+		p.logger.Debug("Redis command result", zap.Any("result", result))
 		return result, nil
 	}
+	p.logger.Error("Unknown command result type", zap.String("command", cmdName))
 	return nil, fmt.Errorf("unknown command result type")
 }
 
@@ -968,120 +988,159 @@ func (p *RedisProxy) buildCacheKey(command []interface{}) string {
 }
 
 // Command handlers
-func (p *RedisProxy) handleSetCommand(ctx context.Context, client redis.UniversalClient, args []interface{}) (interface{}, error) {
-	if len(args) < 2 {
+func (p *RedisProxy) handleSetCommand(ctx context.Context, client redis.UniversalClient, fullCommand []interface{}) (interface{}, error) {
+	if len(fullCommand) < 3 { // SET command + key + value
 		return nil, fmt.Errorf("SET requires at least 2 arguments")
 	}
-	
-	key := fmt.Sprintf("%v", args[0])
-	value := args[1]
-	
-	// Handle SET with options (EX, PX, NX, XX, etc.)
-	cmd := redis.NewStatusCmd(ctx, append([]interface{}{"SET", key, value}, args[2:]...)...)
-	client.Process(ctx, cmd)
-	return cmd.Result()
+
+	key, ok := fullCommand[1].(string)
+	if !ok {
+		return nil, fmt.Errorf("SET key must be a string")
+	}
+	value := fullCommand[2]
+
+	// Handle optional arguments for SET command (e.g., EX, PX, NX, XX, GET)
+	// This is a simplified example and might need more robust parsing
+	var expiration time.Duration
+	setArgs := []string{}
+	for i := 3; i < len(fullCommand); i++ {
+		arg, ok := fullCommand[i].(string)
+		if !ok {
+			return nil, fmt.Errorf("SET option must be a string")
+		}
+		s := strings.ToUpper(arg)
+		switch s {
+		case "EX":
+			if i+1 < len(fullCommand) {
+				exp, err := strconv.Atoi(fmt.Sprintf("%v", fullCommand[i+1]))
+				if err != nil {
+					return nil, fmt.Errorf("invalid EX value")
+				}
+				expiration = time.Duration(exp) * time.Second
+				i++
+			}
+		case "PX":
+			if i+1 < len(fullCommand) {
+				exp, err := strconv.Atoi(fmt.Sprintf("%v", fullCommand[i+1]))
+				if err != nil {
+					return nil, fmt.Errorf("invalid PX value")
+				}
+				expiration = time.Duration(exp) * time.Millisecond
+				i++
+			}
+		case "NX", "XX", "GET":
+			setArgs = append(setArgs, s)
+		default:
+			return nil, fmt.Errorf("unsupported SET option: %s", arg)
+		}
+	}
+
+	// Apply SET options
+	for _, opt := range setArgs {
+		switch opt {
+		case "NX":
+			return client.SetNX(ctx, key, value, expiration).Result()
+		case "XX":
+			return client.SetXX(ctx, key, value, expiration).Result()
+		case "GET":
+			// SET GET is not directly supported by go-redis Set() method, it's a separate command
+			// For simplicity, we'll just return the value after setting it.
+			// A more robust solution would involve calling client.Get() after client.Set()
+			_, err := client.Set(ctx, key, value, expiration).Result()
+			if err != nil {
+				return nil, err
+			}
+			val, err := client.Get(ctx, key).Result()
+			if err != nil && err != redis.Nil {
+				return nil, err
+			}
+			return val, nil
+		}
+	}
+
+	return client.Set(ctx, key, value, expiration).Result()
 }
 
-func (p *RedisProxy) handleMGetCommand(ctx context.Context, client redis.UniversalClient, args []interface{}) (interface{}, error) {
-	if len(args) == 0 {
+func (p *RedisProxy) handleMGetCommand(ctx context.Context, client redis.UniversalClient, fullCommand []interface{}) (interface{}, error) {
+	if len(fullCommand) < 2 { // MGET command + at least one key
 		return nil, fmt.Errorf("MGET requires at least 1 argument")
 	}
 	
-	keys := make([]string, len(args))
-	for i, arg := range args {
-		keys[i] = fmt.Sprintf("%v", arg)
-	}
-	
-	return client.MGet(ctx, keys...).Result()
+	// The fullCommand array already contains the command name as the first element
+	// So, we can directly pass it to client.Do
+	cmd := client.Do(ctx, fullCommand...)
+	return cmd.Result()
 }
 
-func (p *RedisProxy) handleMSetCommand(ctx context.Context, client redis.UniversalClient, args []interface{}) (interface{}, error) {
-	if len(args)%2 != 0 {
+func (p *RedisProxy) handleMSetCommand(ctx context.Context, client redis.UniversalClient, fullCommand []interface{}) (interface{}, error) {
+	if len(fullCommand) < 3 || len(fullCommand)%2 != 1 { // MSET command + at least one key-value pair
 		return nil, fmt.Errorf("MSET requires an even number of arguments")
 	}
 	
-	pairs := make([]interface{}, len(args))
-	copy(pairs, args)
-	
-	return client.MSet(ctx, pairs...).Result()
+	// The fullCommand array already contains the command name as the first element
+	// So, we can directly pass it to client.Do
+	cmd := client.Do(ctx, fullCommand...)
+	return cmd.Result()
 }
 
-func (p *RedisProxy) handleEvalCommand(ctx context.Context, client redis.UniversalClient, args []interface{}) (interface{}, error) {
-	if len(args) < 2 {
+func (p *RedisProxy) handleEvalCommand(ctx context.Context, client redis.UniversalClient, fullCommand []interface{}) (interface{}, error) {
+	if len(fullCommand) < 3 { // EVAL command + script + numkeys
 		return nil, fmt.Errorf("EVAL requires at least 2 arguments")
 	}
 	
-	script := fmt.Sprintf("%v", args[0])
-	numKeys, err := strconv.Atoi(fmt.Sprintf("%v", args[1]))
-	if err != nil {
-		return nil, fmt.Errorf("invalid number of keys: %v", err)
-	}
-	
-	keys := make([]string, numKeys)
-	for i := 0; i < numKeys; i++ {
-		if i+2 >= len(args) {
-			return nil, fmt.Errorf("not enough keys provided")
-		}
-		keys[i] = fmt.Sprintf("%v", args[i+2])
-	}
-	
-	values := args[numKeys+2:]
-	
-	return client.Eval(ctx, script, keys, values...).Result()
+	// The fullCommand array already contains the command name as the first element
+	// So, we can directly pass it to client.Do
+	cmd := client.Do(ctx, fullCommand...)
+	return cmd.Result()
 }
 
-func (p *RedisProxy) handleEvalShaCommand(ctx context.Context, client redis.UniversalClient, args []interface{}) (interface{}, error) {
-	if len(args) < 2 {
+func (p *RedisProxy) handleEvalShaCommand(ctx context.Context, client redis.UniversalClient, fullCommand []interface{}) (interface{}, error) {
+	if len(fullCommand) < 3 { // EVALSHA command + sha + numkeys
 		return nil, fmt.Errorf("EVALSHA requires at least 2 arguments")
 	}
 	
-	sha := fmt.Sprintf("%v", args[0])
-	numKeys, err := strconv.Atoi(fmt.Sprintf("%v", args[1]))
-	if err != nil {
-		return nil, fmt.Errorf("invalid number of keys: %v", err)
-	}
-	
-	keys := make([]string, numKeys)
-	for i := 0; i < numKeys; i++ {
-		if i+2 >= len(args) {
-			return nil, fmt.Errorf("not enough keys provided")
-		}
-		keys[i] = fmt.Sprintf("%v", args[i+2])
-	}
-	
-	values := args[numKeys+2:]
-	
-	return client.EvalSha(ctx, sha, keys, values...).Result()
+	// The fullCommand array already contains the command name as the first element
+	// So, we can directly pass it to client.Do
+	cmd := client.Do(ctx, fullCommand...)
+	return cmd.Result()
 }
 
-func (p *RedisProxy) handlePingCommand(ctx context.Context, client redis.UniversalClient, args []interface{}) (interface{}, error) {
-	if len(args) == 0 {
+func (p *RedisProxy) handlePingCommand(ctx context.Context, client redis.UniversalClient, fullCommand []interface{}) (interface{}, error) {
+	// PING with no arguments returns PONG
+	// PING with one argument returns that argument
+	if len(fullCommand) == 1 {
 		return client.Ping(ctx).Result()
+	} else if len(fullCommand) == 2 {
+		return fullCommand[1], nil // Return the argument itself
 	}
-	// message := fmt.Sprintf("%v", args[0])
-	return client.Ping(ctx).Result() // Redis PING with message not directly supported, return PONG
+	return nil, fmt.Errorf("PING requires 0 or 1 arguments")
 }
 
-func (p *RedisProxy) handleInfoCommand(ctx context.Context, client redis.UniversalClient, args []interface{}) (interface{}, error) {
-	if len(args) == 0 {
-		return client.Info(ctx).Result()
-	}
-	section := fmt.Sprintf("%v", args[0])
-	return client.Info(ctx, section).Result()
+func (p *RedisProxy) handleInfoCommand(ctx context.Context, client redis.UniversalClient, fullCommand []interface{}) (interface{}, error) {
+	// The fullCommand array already contains the command name as the first element
+	// So, we can directly pass it to client.Do
+	cmd := client.Do(ctx, fullCommand...)
+	return cmd.Result()
 }
 
-func (p *RedisProxy) handleFlushAllCommand(ctx context.Context, client redis.UniversalClient, args []interface{}) (interface{}, error) {
-	return client.FlushAll(ctx).Result()
+func (p *RedisProxy) handleFlushAllCommand(ctx context.Context, client redis.UniversalClient, fullCommand []interface{}) (interface{}, error) {
+	// The fullCommand array already contains the command name as the first element
+	// So, we can directly pass it to client.Do
+	cmd := client.Do(ctx, fullCommand...)
+	return cmd.Result()
 }
 
-func (p *RedisProxy) handleFlushDBCommand(ctx context.Context, client redis.UniversalClient, args []interface{}) (interface{}, error) {
-	return client.FlushDB(ctx).Result()
+func (p *RedisProxy) handleFlushDBCommand(ctx context.Context, client redis.UniversalClient, fullCommand []interface{}) (interface{}, error) {
+	// The fullCommand array already contains the command name as the first element
+	// So, we can directly pass it to client.Do
+	cmd := client.Do(ctx, fullCommand...)
+	return cmd.Result()
 }
 
-func (p *RedisProxy) handleReadOnlyCommand(ctx context.Context, client redis.UniversalClient, args []interface{}) (interface{}, error) {
+func (p *RedisProxy) handleReadOnlyCommand(ctx context.Context, client redis.UniversalClient, fullCommand []interface{}) (interface{}, error) {
 	// Use read replica if available
-	readClient := p.selectClient("GET") // Use GET as proxy for read-only
-	cmd := readClient.Do(ctx, args...)
+	readClient := p.selectClient(strings.ToUpper(fmt.Sprintf("%v", fullCommand[0])))
+	cmd := readClient.Do(ctx, fullCommand...)
 	return cmd.Result()
 }
 
@@ -1102,11 +1161,13 @@ func (p *RedisProxy) handlePipeline(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var pipelineReq [][]interface{} // Changed to directly unmarshal array of command arrays
+	var pipelineReq [][]interface{}
 	if err := json.Unmarshal(body, &pipelineReq); err != nil {
 		p.sendErrorResponse(w, "Invalid JSON in request body", http.StatusBadRequest)
-		return
+		return	
 	}
+
+	p.logger.Debug("Received pipeline request", zap.Any("commands", pipelineReq))
 
 	if len(pipelineReq) == 0 {
 		p.sendErrorResponse(w, "Empty pipeline", http.StatusBadRequest)
@@ -1119,29 +1180,47 @@ func (p *RedisProxy) handlePipeline(w http.ResponseWriter, r *http.Request) {
 
 	// Add commands to pipeline
 	cmds := make([]redis.Cmder, len(pipelineReq))
-	for i, cmdArgs := range pipelineReq { // Iterate directly over command arguments
+	for i, cmdArgs := range pipelineReq {
 		if len(cmdArgs) == 0 {
 			results[i] = UpstashResponse{Error: "empty command"}
 			continue
 		}
-		cmds[i] = pipe.Do(r.Context(), cmdArgs...)
+		
+		var decodedCmdArgs []interface{}
+		if r.Header.Get("Upstash-Encoding") == "base64" {
+			var err error
+			decodedCmdArgs, err = base64DecodeCommand(cmdArgs)
+			if err != nil {
+				results[i] = UpstashResponse{Error: fmt.Sprintf("Failed to decode command in pipeline: %v", err)}
+				continue
+			}
+		} else {
+			decodedCmdArgs = cmdArgs
+		}
+		cmds[i] = pipe.Do(r.Context(), decodedCmdArgs...)
 	}
 
 	// Execute pipeline
 	_, err = pipe.Exec(r.Context())
 	if err != nil && err != redis.Nil {
-		p.logger.Error("Pipeline execution failed", zap.Error(err))
+		p.sendErrorResponse(w, fmt.Sprintf("Pipeline execution failed: %v", err), http.StatusInternalServerError)
+		return
 	}
 
 	// Collect results
 	for i, cmd := range cmds {
 		if cmd == nil {
+			results[i] = UpstashResponse{Result: nil} // Treat nil command as null result
 			continue
 		}
 		if resCmd, ok := cmd.(interface{ Result() (interface{}, error) }); ok {
 			result, err := resCmd.Result()
 			if err != nil {
-				results[i] = UpstashResponse{Error: err.Error()}
+				if err == redis.Nil {
+					results[i] = UpstashResponse{Result: nil} // Convert redis.Nil to JSON null
+				} else {
+					results[i] = UpstashResponse{Error: err.Error()}
+				}
 			} else {
 				results[i] = UpstashResponse{Result: result}
 			}
@@ -1150,6 +1229,7 @@ func (p *RedisProxy) handlePipeline(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	p.logger.Debug("Pipeline results", zap.Any("results", results))
 	p.sendJSONResponse(w, results, "", r)
 }
 
@@ -1165,26 +1245,40 @@ func (p *RedisProxy) handleMultiExec(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var multiReq MultiExecRequest // MultiExecRequest now directly holds [][]interface{}
-	if err := json.Unmarshal(body, &multiReq); err != nil {
+	var commands [][]interface{}
+	if err := json.Unmarshal(body, &commands); err != nil {
 		p.sendErrorResponse(w, "Invalid JSON in request body", http.StatusBadRequest)
 		return
 	}
 
-	if len(multiReq.Commands) == 0 {
+	p.logger.Debug("Received multi-exec request", zap.Any("commands", commands))
+
+	if len(commands) == 0 {
 		p.sendErrorResponse(w, "Empty transaction", http.StatusBadRequest)
 		return
 	}
 
 	// Execute transaction
 	tx := p.redisClient.TxPipeline()
-	cmds := make([]redis.Cmder, len(multiReq.Commands))
+	cmds := make([]redis.Cmder, len(commands))
+	response := make([]UpstashResponse, len(commands)) // Moved declaration here
 
-	for i, cmdArgs := range multiReq.Commands { // Iterate directly over command arguments
+	for i, cmdArgs := range commands {
 		if len(cmdArgs) == 0 {
 			continue
 		}
-		cmds[i] = tx.Do(r.Context(), cmdArgs...)
+		var decodedCmdArgs []interface{}
+		if r.Header.Get("Upstash-Encoding") == "base64" {
+			var err error
+			decodedCmdArgs, err = base64DecodeCommand(cmdArgs)
+			if err != nil {
+				response[i] = UpstashResponse{Error: fmt.Sprintf("Failed to decode command in multi-exec: %v", err)}
+				continue
+			}
+		} else {
+			decodedCmdArgs = cmdArgs
+		}
+		cmds[i] = tx.Do(r.Context(), decodedCmdArgs...)
 	}
 
 	results, err := tx.Exec(r.Context())
@@ -1192,9 +1286,6 @@ func (p *RedisProxy) handleMultiExec(w http.ResponseWriter, r *http.Request) {
 		p.sendErrorResponse(w, fmt.Sprintf("Transaction failed: %v", err), http.StatusInternalServerError)
 		return
 	}
-
-	// Convert results to Upstash format
-	response := make([]UpstashResponse, len(results))
 	for i, result := range results {
 		if cmd, ok := result.(interface{ Result() (interface{}, error) }); ok {
 			val, err := cmd.Result()
@@ -1208,6 +1299,7 @@ func (p *RedisProxy) handleMultiExec(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	p.logger.Debug("Multi-exec results", zap.Any("results", results))
 	p.sendJSONResponse(w, response, "", r)
 }
 
@@ -1228,7 +1320,7 @@ func (p *RedisProxy) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	p.logger.Info("WebSocket connection established", zap.String("remote_addr", r.RemoteAddr))
 
 	for {
-		var command []interface{} // Changed to directly unmarshal array of command and arguments
+		var command []interface{}
 		if err := conn.ReadJSON(&command); err != nil {
 			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
 				p.logger.Error("WebSocket read error", zap.Error(err))
@@ -1236,8 +1328,20 @@ func (p *RedisProxy) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 
+		var decodedCommand []interface{}
+		if r.Header.Get("Upstash-Encoding") == "base64" {
+			var err error
+			decodedCommand, err = base64DecodeCommand(command)
+			if err != nil {
+				p.logger.Error("Failed to decode command in websocket", zap.Error(err))
+				continue
+			}
+		} else {
+			decodedCommand = command
+		}
+
 		// Execute command
-		result, err := p.executeCommand(r.Context(), command)
+		result, err := p.executeCommand(r.Context(), decodedCommand)
 		
 		var response UpstashResponse
 		if err != nil {
@@ -1410,15 +1514,46 @@ func (p *RedisProxy) sendJSONResponse(w http.ResponseWriter, data interface{}, s
 	}
 }
 
+func base64DecodeCommand(command []interface{}) ([]interface{}, error) {
+	decodedCommand := make([]interface{}, len(command))
+	for i, arg := range command {
+		if strArg, ok := arg.(string); ok {
+			decodedBytes, err := base64.StdEncoding.DecodeString(strArg)
+			if err != nil {
+				// If it's not a valid base64 string, treat it as a regular string
+				decodedCommand[i] = arg
+			} else {
+				decodedCommand[i] = string(decodedBytes)
+			}
+		} else if nestedArray, ok := arg.([]interface{}); ok {
+			// Recursively decode nested arrays
+			decodedNestedArray, err := base64DecodeCommand(nestedArray)
+			if err != nil {
+				return nil, err
+			}
+			decodedCommand[i] = decodedNestedArray
+		} else {
+			decodedCommand[i] = arg
+		}
+	}
+	return decodedCommand, nil
+}
+
 func base64Encode(data interface{}) (interface{}, error) {
 	if data == nil {
 		return nil, nil
 	}
+	if err, isErr := data.(error); isErr && err == redis.Nil {
+		return nil, nil // Convert redis.Nil to JSON null
+	}
+
 	switch v := data.(type) {
 	case string:
 		return base64.StdEncoding.EncodeToString([]byte(v)), nil
 	case []byte:
 		return base64.StdEncoding.EncodeToString(v), nil
+	case int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64, float32, float64, bool:
+		return v, nil // Return numbers and booleans as-is
 	case []interface{}:
 		encodedSlice := make([]interface{}, len(v))
 		for i, item := range v {
@@ -1429,6 +1564,26 @@ func base64Encode(data interface{}) (interface{}, error) {
 			encodedSlice[i] = encodedItem
 		}
 		return encodedSlice, nil
+	case []string:
+		encodedSlice := make([]interface{}, len(v))
+		for i, item := range v {
+			encodedItem, err := base64Encode(item)
+			if err != nil {
+				return nil, err
+			}
+			encodedSlice[i] = encodedItem
+		}
+		return encodedSlice, nil
+	case map[string]interface{}:
+		encodedMap := make(map[string]interface{}, len(v))
+		for key, item := range v {
+			encodedItem, err := base64Encode(item)
+			if err != nil {
+				return nil, err
+			}
+			encodedMap[key] = encodedItem
+		}
+		return encodedMap, nil
 	default:
 		// For other types, convert to string and then encode
 		s := fmt.Sprintf("%v", v)

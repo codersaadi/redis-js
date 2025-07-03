@@ -8,12 +8,12 @@ services:
       - "9090:9090" # Metrics port
     environment:
       - REDIS_ADDR=redis:6379
-      - REDIS_PASSWORD=your-redis-password
+      - REDIS_PASSWORD=
       - REDIS_DB=0
       - REDIS_CLUSTER_MODE=false
       - REDIS_TLS_ENABLED=false
       - PORT=8080
-      - AUTH_TOKEN=${AUTH_TOKEN:-your-secret-token}
+      - AUTH_TOKEN=test_token
       - JWT_SECRET=${JWT_SECRET:-your-jwt-secret}
       - ENABLE_HMAC=false
       - HMAC_SECRET=${HMAC_SECRET:-your-hmac-secret}
@@ -27,7 +27,7 @@ services:
       - ENABLE_STREAMING=true
       - ENABLE_READ_REPLICAS=true
       - READ_REPLICA_NODES=redis-replica-1:6379,redis-replica-2:6379
-      - RATE_LIMIT_ENABLED=true
+      - RATE_LIMIT_ENABLED=false
       - RATE_LIMIT_RPS=1000
       - RATE_LIMIT_BURST=100
       - ADAPTIVE_RATE_LIMIT=true
@@ -50,11 +50,26 @@ services:
       start_period: 40s
     networks:
       - redis-network
+
+  redis:
+    image: redis/redis-stack:latest
+    hostname: redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
     networks:
       - redis-network
 
   redis-replica-1:
-    image: redis:7-alpine
+    image: redis/redis-stack:latest
+    hostname: redis-replica-1
     ports:
       - "6380:6379"
     command: >
@@ -79,7 +94,8 @@ services:
       - redis-network
 
   redis-replica-2:
-    image: redis:7-alpine
+    image: redis/redis-stack:latest
+    hostname: redis-replica-2
     ports:
       - "6381:6379"
     command: >
