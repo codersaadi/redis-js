@@ -1378,7 +1378,7 @@ func getEnvBool(key string, defaultValue bool) bool {
 func getEnvDuration(key string, defaultValue time.Duration) time.Duration {
 	if value := os.Getenv(key); value != "" {
 		if duration, err := time.ParseDuration(value); err == nil {
-			return duration
+			return duration		
 		}
 	}
 	return defaultValue
